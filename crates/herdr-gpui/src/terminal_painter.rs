@@ -8,6 +8,7 @@ use crate::terminal::*;
 use gpui::*;
 use herdr_client::protocol::{CellData, FrameData, PaneSurfacePane, SurfaceRect};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 /// The selection tints the cells it covers instead of replacing their colors:
 /// a terminal's own background is meaningful, and the glyphs above it stay
@@ -141,20 +142,42 @@ fn paint_glyphs(
     Ok(())
 }
 
+fn background_cells<'a>(
+    row: &'a [CellData],
+    theme: &'a Theme,
+) -> impl Iterator<Item = (usize, u32)> + 'a {
+    let mut continuation = 0;
+    let mut leading_bg = theme.background;
+    row.iter().enumerate().map(move |(index, cell)| {
+        // A wide glyph covers its continuation cell even when that cell keeps
+        // the daemon's default background instead of the leading cell's style.
+        if continuation > 0 && (cell.skip || cell.symbol.is_empty() || cell.symbol == " ") {
+            continuation -= 1;
+            return (index, leading_bg);
+        }
+        leading_bg = cell_colors(cell, theme).1;
+        continuation = if cell.symbol.len() == 1 {
+            0
+        } else {
+            cell.symbol.width().saturating_sub(1).min(1)
+        };
+        (index, leading_bg)
+    })
+}
+
 fn background_spans<'a>(
     row: &'a [CellData],
     theme: &'a Theme,
 ) -> impl Iterator<Item = (usize, usize, u32)> + 'a {
-    let mut start = 0;
+    let mut cells = background_cells(row, theme).peekable();
     std::iter::from_fn(move || {
-        let color = cell_colors(row.get(start)?, theme).1;
+        let (start, color) = cells.next()?;
         let mut end = start + 1;
-        while end < row.len() && cell_colors(&row[end], theme).1 == color {
+        while cells.peek().is_some_and(|(_, next)| *next == color) {
+            cells.next();
             end += 1;
         }
-        let span = (start, end, color);
-        start = end;
-        Some(span)
+        Some((start, end, color))
     })
 }
 
@@ -347,8 +370,8 @@ impl TerminalPainter {
                         paint(start, end, color);
                     }
                 } else {
-                    for (x, cell) in row.iter().enumerate() {
-                        paint(x, x + 1, cell_colors(cell, &self.theme).1);
+                    for (x, color) in background_cells(row, &self.theme) {
+                        paint(x, x + 1, color);
                     }
                 }
             }
@@ -804,6 +827,46 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn wide_character_continuation_keeps_leading_background() {
+        let theme = Theme::default();
+        let light_background = 0xf7fff9;
+        let row = [
+            CellData {
+                bg: 0x02f7fff9,
+                ..cell("中")
+            },
+            CellData {
+                skip: true,
+                ..cell(" ")
+            },
+            cell("x"),
+        ];
+        assert_eq!(
+            background_spans(&row, &theme).collect::<Vec<_>>(),
+            vec![(0, 2, light_background), (2, 3, theme.background)]
+        );
+        assert_eq!(
+            background_cells(&row, &theme).collect::<Vec<_>>(),
+            vec![
+                (0, light_background),
+                (1, light_background),
+                (2, theme.background)
+            ]
+        );
+        let narrow = [
+            CellData {
+                bg: 0x02f7fff9,
+                ..cell("é")
+            },
+            cell(" "),
+        ];
+        assert_eq!(
+            background_spans(&narrow, &theme).collect::<Vec<_>>(),
+            vec![(0, 1, light_background), (1, 2, theme.background)]
+        );
     }
 
     #[test]
